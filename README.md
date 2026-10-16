@@ -1,6 +1,10 @@
-# Monitor local de execuções Kaggle para o Codex
+# Supervisor local de processos assíncronos para o Codex
 
-Este projeto propõe uma camada local para acompanhar execuções Kaggle sem manter o agente do Codex em polling. O agente envia um job e recebe um `job_id`; um supervisor local acompanha a execução sem invocar o modelo e, ao final, tenta entregar o resultado na conversa original.
+Este projeto propõe um supervisor local que acompanha trabalhos demorados fora do ciclo do modelo e avisa o Codex quando há um resultado. O problema que originou a ideia foi a integração com o Kaggle: depois de iniciar um notebook, o agente precisava consultar repetidamente o status do serviço. Esse polling mantinha turnos ativos, consumia tokens e limites, atrasava outros trabalhos e desperdiçava chamadas enquanto nada havia mudado.
+
+O agente deve iniciar o trabalho e continuar com outras tarefas. Um processo local monitora o trabalho sem invocar o modelo e, quando há uma mudança relevante ou conclusão, tenta entregar um evento à conversa original do Codex. O Codex precisa permanecer aberto durante o monitoramento; jobs persistidos são reconciliados quando o supervisor volta a iniciar.
+
+Kaggle é a primeira integração prevista, não o limite do produto. A arquitetura deve permitir adicionar adaptadores para outros serviços de jobs, ferramentas CLI e processos locais demorados, mantendo um ciclo de vida e uma entrega de eventos consistentes. Cada integração preserva suas capacidades e semântica próprias; o núcleo não deve esconder diferenças importantes em uma abstração genérica.
 
 ## Decisões aprovadas
 
@@ -13,7 +17,7 @@ Este projeto propõe uma camada local para acompanhar execuções Kaggle sem man
 
 ## Arquitetura proposta
 
-O servidor MCP local expõe ferramentas de submissão e consulta. Um supervisor acompanha o Kaggle pela CLI/API, persiste o ciclo de vida em SQLite e cria um evento de conclusão durável. Um adaptador Codex tenta entregar esse evento à thread que originou o job.
+O servidor MCP local expõe ferramentas para registrar e consultar trabalhos. Um supervisor coordena adaptadores de integração, persiste o ciclo de vida em SQLite e cria eventos duráveis. Um adaptador Codex tenta entregar esses eventos à thread que originou o trabalho.
 
 ```mermaid
 flowchart LR
@@ -22,13 +26,15 @@ flowchart LR
     A --> D[Domínio: Job e estados]
     A --> R[(SQLite: jobs + outbox)]
     S[Supervisor] --> A
-    S --> K[Adaptador Kaggle CLI/API]
+    S --> P[Porta de integração]
+    P --> K[Adaptador Kaggle: primeira integração]
+    P -.-> F[Adaptadores futuros: serviços, CLI, processos locais]
     K --> G[Serviço Kaggle]
     S --> X[Adaptador de retomada Codex]
     X -->|retomar mesma thread| C
 ```
 
-Os limites entre os componentes, o fluxo, os estados, os padrões, as falhas e o modelo de ameaças estão em [docs/architecture.md](docs/architecture.md). As decisões duradouras ficam em [docs/decisions/ADR-001-modular-monolith-typescript.md](docs/decisions/ADR-001-modular-monolith-typescript.md).
+Os limites entre os componentes, o fluxo, os estados, os padrões, as falhas e o modelo de ameaças estão em [docs/architecture.md](docs/architecture.md). As decisões duradouras ficam em [ADR-001](docs/decisions/ADR-001-modular-monolith-typescript.md) e [ADR-002](docs/decisions/ADR-002-provider-agnostic-integrations.md).
 
 ## Contribuições e segurança
 
