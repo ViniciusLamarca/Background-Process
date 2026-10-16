@@ -1,25 +1,30 @@
-# Arquitetura — monitor local de execuções Kaggle
+# Arquitetura — supervisor local de trabalhos assíncronos
 
 **Estado:** desenho aprovado para orientar um spike; implementação ainda não aprovada.  
 **Atualizado:** 15/10/2026
 
 ## Objetivo e limites
 
-O Codex deve poder iniciar uma execução Kaggle, receber um identificador e continuar outro trabalho. Um processo local acompanha o job fora do modelo. Quando o job termina, o processo tenta retomar a mesma thread do Codex com um resumo curto e referências aos outputs.
+O Codex deve poder iniciar ou registrar um trabalho demorado, receber um identificador e continuar outro trabalho. Um supervisor local acompanha o trabalho fora do modelo. Quando há uma mudança relevante ou o trabalho termina, o processo tenta retomar a mesma thread do Codex com um resumo curto e referências aos outputs.
+
+O problema que motivou o projeto veio do Kaggle: o agente iniciava um notebook e então fazia polling repetido para descobrir quando terminava. Isso mantinha o modelo ocupado, consumia tokens e limites e bloqueava a atenção do agente enquanto não havia novidade. O supervisor transfere essa espera para um processo local que não chama o modelo periodicamente.
+
+Kaggle é o primeiro provedor em foco. O produto deve permanecer aberto a outras integrações, como serviços de execução remota, CLIs e processos locais longos. O núcleo padroniza identidade, associação com a thread, estados, persistência, recuperação, entrega, limites operacionais e observabilidade. Adaptadores traduzem os contratos externos sem presumir que todos os provedores têm as mesmas capacidades.
 
 O Codex precisa permanecer aberto durante o monitoramento. A persistência permite recuperar jobs caso o processo local reinicie; ela não implica que o monitor continue após o Codex fechar. Ao iniciar novamente, o supervisor reconcilia jobs que ainda não estejam em estado terminal.
 
-Não estão no escopo: alterar Kaggle, depender de webhook Kaggle, criar conversa paralela, usar heartbeat de LLM para consultar status, cancelar remotamente kernels sem contrato confiável, ler dados privados não solicitados, ou enviar credenciais de negociação.
+Não estão no escopo: alterar Kaggle ou outros provedores, depender de webhooks não documentados, criar conversa paralela, usar heartbeat de LLM para consultar status, executar comandos arbitrários fornecidos pelo modelo, cancelar trabalho remoto sem contrato confiável, ler dados privados não solicitados, ou enviar credenciais de negociação.
 
 ## Componentes e dependências
 
 ```text
 MCP (transporte local)
-  └─ casos de uso: SubmeterJob, ConsultarJob, ReconciliarJobs, EntregarConclusão
-       ├─ domínio: JobKaggle, estados e invariantes
-       ├─ porta KaggleExecutionPort
-       │    └─ adaptador Kaggle CLI/API
-       ├─ porta JobRepository / CompletionOutbox
+  └─ casos de uso: RegistrarTrabalho, ConsultarTrabalho, Reconciliar, EntregarEvento
+       ├─ domínio: TrabalhoMonitorado, estados e invariantes
+       ├─ porta BackgroundWorkPort
+       │    ├─ adaptador Kaggle CLI/API (primeiro)
+       │    └─ adaptadores futuros (serviços, CLI, processos locais)
+       ├─ porta WorkRepository / CompletionOutbox
        │    └─ adaptador SQLite
        └─ porta CodexConversationPort
             └─ adaptador Codex SDK ou app-server (decidir pelo spike)
@@ -30,17 +35,23 @@ Supervisor local
   └─ entrega conclusões pendentes sem concorrência na thread
 ```
 
-O domínio e os casos de uso não importam MCP, SQLite, processos do sistema operacional, Kaggle SDK nem tipos do Codex. Adaptadores implementam portas pertencentes à aplicação. O transporte MCP valida e converte entradas e chama casos de uso; regras de estado ficam no domínio/aplicação.
+O domínio e os casos de uso não importam MCP, SQLite, processos do sistema operacional, SDKs de provedores nem tipos do Codex. Adaptadores implementam portas pertencentes à aplicação. O transporte MCP valida e converte entradas e chama casos de uso; regras de estado ficam no domínio/aplicação.
+
+### Contrato para integrações
+
+Cada adaptador representa um tipo de trabalho e expõe somente capacidades que consegue cumprir com segurança. Identidade/correlação e observação de estado são requisitos para qualquer trabalho monitorado; submissão, cancelamento, coleta de outputs e consulta de logs são capacidades opcionais explícitas. Um processo local preexistente pode ser registrado e observado sem o supervisor iniciá-lo. Não assumir semântica uniforme de cancelamento, idempotência ou retenção entre provedores.
+
+Antes de adicionar um adaptador, documentar método de autenticação, limites de frequência, timeout, IDs confiáveis, estados terminais, comportamento após falha/desconexão, capacidades suportadas e quais dados retornam ao Codex. Adaptadores passam por uma suíte de contrato comum para invariantes do núcleo e testes específicos para semântica do provedor. Isso mantém integrações substituíveis sem introduzir um sistema de plugins dinâmico no MVP.
 
 É um monólito local com módulos explícitos, não um conjunto de microsserviços. O trabalho principal é I/O de rede e coordenação; não há evidência de que o caminho quente exija código Go. Uma futura peça Go só entra após perfil e benchmark reproduzível demonstrarem gargalo relevante, com contrato de processo/IPC estreito e substituível.
 
 ## Fluxo principal
 
-1. O agente chama `submit_kaggle_job` com kernel permitido, diretório/revisão permitidos e contexto mínimo da continuação.
+1. O agente chama uma ferramenta adequada ao adaptador disponível, por exemplo `submit_kaggle_job` inicialmente, com recurso/escopo permitido e contexto mínimo da continuação.
 2. A aplicação valida o pedido, associa-o à thread atual e grava `submitting` antes da chamada externa.
-3. O adaptador Kaggle envia o run usando operação e argumentos fixos, sem shell genérico. Após confirmação, o repositório grava o identificador remoto e estado `queued` ou `running`.
+3. O adaptador correspondente inicia ou registra o trabalho usando operação e argumentos fixos, sem shell genérico. Após confirmação, o repositório grava o identificador externo e o estado conhecido.
 4. O MCP devolve `job_id` sem esperar pelo kernel. O modelo não precisa continuar ativo para o supervisor consultar Kaggle.
-5. O supervisor consulta status com espera adaptativa, limite de frequência e jitter. Consultas falhas são limitadas; erros persistentes viram estado visível, não repetição infinita.
+5. O supervisor observa status pelo mecanismo disponível no adaptador; quando precisar consultar, usa espera adaptativa, limite de frequência e jitter. Consultas falhas são limitadas; erros persistentes viram estado visível, não repetição infinita.
 6. Ao detectar conclusão, uma única transação SQLite grava o estado terminal e um registro de outbox pendente.
 7. O adaptador Codex verifica a associação do job à thread original e tenta enfileirar uma continuação segura. Se a thread estiver ocupada, a conclusão permanece pendente até haver um ponto suportado para continuar.
 8. Quando a entrega for confirmada, a outbox é marcada como entregue. Uma repetição local do evento não deve iniciar deliberadamente uma segunda continuação.
@@ -75,20 +86,32 @@ Invariantes:
 
 | Pattern | Aplicação | Por que aqui |
 |---|---|---|
-| Ports and Adapters (hexagonal), em escala pequena | Kaggle CLI/API, SQLite e Codex ficam atrás de portas da aplicação | Permite testar workflows sem acoplar domínio a fornecedores e trocar o método de retomada após o spike. |
+| Ports and Adapters (hexagonal), em escala pequena | Kaggle e futuras integrações, SQLite e Codex ficam atrás de portas da aplicação | Permite testar workflows sem acoplar domínio a fornecedores e adicionar adaptadores conforme a necessidade real. |
 | Application Service / Use Case | Submissão, reconciliação, consulta e entrega | Dá um lugar explícito a cada workflow transacional e mantém ferramentas MCP finas. |
 | State machine explícita | Ciclo de vida do job e ciclo de vida da entrega | Torna falhas, reinícios e estados ambíguos observáveis, evitando booleans contraditórios. |
 | Transactional outbox | Resultado terminal e evento de conclusão na mesma transação SQLite | Evita perder conclusão entre gravar o estado e acordar o controlador. A entrega externa continua sujeita a confirmação/reconciliação. |
 | Idempotência e deduplicação | `job_id`, evento e entrega | O monitor pode reiniciar/reconciliar; duplicatas não devem causar novo kernel ou turno sem verificação. |
-| Adapter / Strategy somente onde varia | Kaggle CLI e Codex SDK/app-server | Isola contratos externos. Não criar plugin framework geral nem abstração Go prematura. |
+| Adapter / Strategy somente onde varia | Provedores de trabalho e Codex SDK/app-server | Isola contratos externos. Não criar plugin framework geral nem abstração Go prematura. |
 
 Não adotar inicialmente Redis, Kafka, serviço remoto, event bus distribuído, CQRS ou arquitetura de microsserviços: uma máquina local e um consumidor de outbox não justificam esses custos operacionais.
 
 ## Persistência, polling e operação
 
-SQLite é suficiente para um processo por usuário, com transações locais e inspeção simples. O banco contém somente metadados necessários à recuperação e correlação; não guardar token Kaggle, output completo do notebook ou conteúdo desnecessário de conversa. Definir retenção configurável antes de implementar cleanup.
+SQLite é suficiente para um processo por usuário, com transações locais e inspeção simples. O banco contém somente metadados necessários à recuperação e correlação; não guardar credenciais de provedores, outputs completos ou conteúdo desnecessário de conversa. Definir retenção configurável antes de implementar cleanup.
 
-O polling é do supervisor, nunca uma chamada recorrente ao modelo. Usar limites de frequência, timeout, backoff exponencial com jitter e teto; classificar falhas transitórias, autenticação expirada, job terminal e status ambíguo. Logs estruturados devem conter `job_id`, tipo de evento, duração e erro classificado, sem tokens, headers de autorização ou dados pessoais.
+O polling é do supervisor, nunca uma chamada recorrente ao modelo. Usar limites por integração, timeout, backoff exponencial com jitter e teto; classificar falhas transitórias, autenticação expirada, trabalho terminal e estado ambíguo. Logs estruturados devem conter `work_id`, tipo de integração/evento, duração e erro classificado, sem tokens, headers de autorização ou dados pessoais.
+
+### Robustez operacional
+
+- Executar como um único supervisor local por usuário do Windows, enquanto o Codex estiver aberto; vários clientes MCP devem anexar-se ao mesmo supervisor e nunca iniciar loops de polling concorrentes. A forma de ciclo de vida e IPC será validada no spike do Codex.
+- Usar trava de instância e handshake de saúde para evitar duas instâncias ativas; o canal local deve aceitar somente o usuário Windows atual. O protocolo concreto, como named pipe, será escolhido durante implementação.
+- Persistir cada transição antes de confirmar comandos ao agente. Na inicialização, reconciliar trabalhos ativos e eventos pendentes; manter outbox transacional e reivindicação de trabalho atômica.
+- Aplicar timeout, backoff limitado com jitter, teto de frequência, limite de concorrência e pausa/circuit breaker por adaptador, evitando tempestades quando um provedor falha ou limita consultas.
+- Fazer shutdown gracioso e liberar recursos; se o processo morrer abruptamente, leases/heartbeats vencidos permitem recuperar a observação sem duas instâncias assumirem o mesmo trabalho.
+- Expor estados acionáveis: supervisor indisponível, autenticação expirada, trabalho parado além do prazo, fila acumulada, lease vencido e entrega Codex pendente/falha.
+- Persistir migrações SQLite versionadas e proteger o banco com permissões do usuário atual. Lock local não oferece garantia distribuída se o projeto evoluir para múltiplos hosts.
+
+Os valores de concorrência, timeout e frequência serão configuráveis por integração com defaults conservadores e verificados com testes determinísticos. O supervisor não deve depender de polling do próprio Codex para se recuperar.
 
 Se o processo cair ou Codex fechar, o SQLite mantém estado e outbox. No próximo início, reconciliar o estado remoto antes de qualquer nova submissão ou entrega. Se o kernel/run não puder ser correlacionado, deixar para atenção manual.
 
@@ -96,20 +119,21 @@ Se o processo cair ou Codex fechar, o SQLite mantém estado e outbox. No próxim
 
 ### Escopo, atores e ativos
 
-- **Atores:** usuário local autorizado, agente Codex, processo monitor local, CLI Kaggle, serviço Kaggle e conteúdo produzido pelo notebook.
-- **Ativos:** credencial Kaggle já configurada localmente; kernel/run; associação job↔thread; histórico/outputs mínimos; capacidade de inserir uma mensagem em uma conversa Codex.
-- **Fronteiras:** Codex↔MCP local; MCP/supervisor↔CLI/Kaggle; supervisor↔SQLite; supervisor↔Codex SDK/app-server; saída Kaggle não confiável↔agente.
-- **Fluxo:** thread chama MCP → aplicação persiste → adaptador chama Kaggle → supervisor consulta status → terminal + outbox em SQLite → adaptador tenta retomar a thread associada.
+- **Atores:** usuário local autorizado, agente Codex, supervisor local, CLIs/serviços externos e conteúdo produzido por trabalhos monitorados.
+- **Ativos:** credenciais que cada integração já usa localmente; identidade/correlação do trabalho; associação trabalho↔thread; metadados e outputs mínimos; capacidade de inserir uma mensagem em uma conversa Codex.
+- **Fronteiras:** Codex↔MCP/IPC local; supervisor↔adaptador/CLI/serviço; supervisor↔SQLite; supervisor↔Codex SDK/app-server; saídas externas não confiáveis↔agente.
+- **Fluxo:** thread chama MCP → aplicação persiste → adaptador inicia/registra trabalho → supervisor observa → terminal + outbox em SQLite → adaptador tenta retomar a thread associada.
 
 | Ameaça / prioridade | Controle e camada | Critério comportamental | Risco residual |
 |---|---|---|---|
-| Entrada adulterada executar comando arbitrário ou selecionar kernel/diretório fora do escopo (**Alta**) | Schema tipado, allowlist, path canonicalization e spawn com executável/argumentos fixos; sem shell genérico | Entradas inválidas e traversal são rejeitados; teste de contrato verifica que metacaracteres não alteram comando | Kaggle ainda executa código enviado pelo usuário no ambiente escolhido |
-| Token Kaggle aparecer em banco, log, erro ou prompt (**Alta**) | Reutilizar auth suportada pela CLI; segredos fora do domínio, persistência e logs; filtrar saída de processo | Fakes de CLI com token sentinela confirmam ausência em banco/logs/erro/resumo | Malware sob a conta Windows pode acessar arquivos de configuração fora do serviço |
-| Status de um run ser associado a outro kernel/job (**Alta**) | Persistir identificador remoto; serializar por kernel até correlação inequívoca; validar transições no domínio | Submissões concorrentes/replays não cruzam resultados; estados desconhecidos viram `needs_attention` | Limitações ou mudanças no contrato Kaggle podem impedir correlação precisa |
+| Entrada adulterada executar comando arbitrário ou acessar recurso fora do escopo (**Alta**) | Schema tipado, allowlist, canonicalização de paths e spawn com executável/argumentos fixos; sem shell genérico | Entradas inválidas, traversal e metacaracteres são rejeitados sem alterar o comando executado | Integrações ainda operam recursos da conta/host já autorizados |
+| Credencial de qualquer integração aparecer em banco, log, erro ou prompt (**Alta**) | Reutilizar auth suportada pelo provedor/CLI; segredos fora do domínio, persistência e logs; filtrar saída de processo | Credenciais sentinela não aparecem no banco, logs, erros nem resumo | Malware sob a conta Windows pode acessar configurações externas ao serviço |
+| Status de um trabalho ser associado ao trabalho errado (**Alta**) | Persistir ID externo e provedor; validar transições; serializar por chave de recurso quando a correlação não for inequívoca | Submissões concorrentes/replays não cruzam resultados; estado desconhecido vira `needs_attention` | Limitações/mudanças no contrato de um provedor podem impedir correlação precisa |
 | Conclusão injetar mensagem em thread errada ou criar turno duplicado (**Alta**) | Associação persistente verificada; adaptador Codex restrito; outbox, dedupe e reconciliação antes de retry | Evento sem vínculo válido é recusado; crash na janela de envio não causa retry cego | Malware sob mesmo usuário local; API pode não expor chave de idempotência/estado suficiente |
 | Conteúdo Kaggle instruir o agente a executar ações não solicitadas (**Média**) | Tratar logs e artefatos como dados externos; resumo limitado a status, run e paths; não seguir instruções em output | Fixture adversarial continua tratada como conteúdo; resumo não a promove a instrução | O agente ainda pode inspecionar artefatos explicitamente pedidos pelo usuário |
 | Falha/reinício perder conclusão ou provocar envio duplicado (**Média**) | Transação terminal+outbox, recuperação no startup, estados separados e reconciliação externa | Reinício antes/depois de terminal entrega ou sinaliza atenção sem perder registro; replay não duplica deliberadamente | Exactly-once externo depende do contrato Codex e pode ser impossível; ambiguidade vira atenção manual |
-| CLI travar, throttling ou autenticação expirar (**Média**) | Timeout, backoff limitado, classificação de erro e estado operacional visível | Erros transitórios param no teto definido; auth expirada pede ação; não existe loop infinito | O job remoto pode continuar mesmo sem monitor local |
+| Adaptador/CLI travar, throttling ou autenticação expirar (**Média**) | Timeout, backoff limitado, classificação de erro, limite por adaptador e estado operacional visível | Erros transitórios param no teto definido; auth expirada pede ação; não existe loop infinito | O trabalho externo pode continuar mesmo sem monitor local |
+| Dois supervisores observarem ou entregarem o mesmo trabalho simultaneamente (**Média**) | Trava de instância, leases persistidos e reivindicação transacional; IPC autenticado ao usuário Windows atual | Duas inicializações simultâneas não criam observadores concorrentes nem duplicam entrega | Exclusão mútua local não cobre múltiplos hosts ou cópias de banco em rede |
 
 ### Segurança fora do escopo
 
@@ -123,9 +147,9 @@ Emitir eventos estruturados como `job_submitted`, `poll_failed`, `job_terminal`,
 
 Os testes obrigatórios na implementação devem se concentrar no comportamento:
 
-1. Submissão válida retorna `job_id` sem esperar o kernel; entrada inválida não inicia processo externo.
-2. Falha de rede segue backoff limitado; autenticação expirada e status ambíguo aparecem explicitamente.
-3. Execuções simultâneas no mesmo kernel não associam status ao job errado.
+1. Submissão/registro válido retorna `work_id` sem esperar a conclusão; entrada inválida não inicia processo externo.
+2. Adaptadores conformes seguem backoff limitado; autenticação expirada e status ambíguo aparecem explicitamente.
+3. Trabalhos simultâneos no mesmo recurso não associam status ao trabalho errado.
 4. Reinício recupera jobs/outbox e não reenvia uma submissão desconhecida às cegas.
 5. Conclusão e outbox são atômicas; repetição e crash-window não geram turno duplicado silenciosamente.
 6. A integração real prova thread desktop original, turno concorrente, entrega enfileirada e uso da autenticação aprovada.
@@ -134,9 +158,11 @@ Os testes obrigatórios na implementação devem se concentrar no comportamento:
 ## Plano por gates
 
 1. **Spike bloqueante:** obter thread ID do chamador MCP e retomar a conversa desktop original via SDK/app-server; provar fila quando ativa; verificar autenticação/limites. Nenhum serviço completo antes deste resultado.
-2. **Contrato:** definir esquema de solicitação, status Kaggle realmente correlacionável, estado/retention SQLite, política de timeout e comportamento de falha/entrega.
-3. **MVP modular:** implementar MCP, máquina de estados, adaptador Kaggle, supervisor, SQLite/outbox e adaptador Codex escolhido.
-4. **Validação real autorizada:** job de teste, reinício do monitor, estados ambíguos/replay e confirmação de ausência de polling LLM.
+2. **Contrato do núcleo:** definir identidade de trabalho, capacidades de observação, estado/retenção SQLite, timeouts e comportamento de falha/entrega sem homogeneizar capacidades opcionais.
+3. **Primeiro adaptador:** validar correlação, limites, autenticação e recuperação para Kaggle, mantendo o contrato comum coberto por testes de conformidade.
+4. **MVP robusto:** implementar MCP, máquina de estados, supervisor, SQLite/outbox, ciclo de vida único/IPC local e adaptador Codex escolhido.
+5. **Integrações seguintes:** adicionar adaptadores sob demanda com avaliação de ameaça, limites operacionais e testes específicos; validar trabalho local e provedores remotos.
+6. **Validação real autorizada:** job de teste, concorrência, reinício, estados ambíguos/replay e confirmação de ausência de polling LLM.
 
 ## Fontes primárias
 
